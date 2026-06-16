@@ -1,0 +1,7 @@
+body { font-family: Arial, sans-serif; margin: 20px; }
+header h1 { margin: 0; }
+nav { margin-top: 8px; }
+main { margin-top: 12px; }
+.flashes { color: #c00; }
+table { border-collapse: collapse; }
+table, th, td { border: 1px solid #ccc; padding: 6px; }

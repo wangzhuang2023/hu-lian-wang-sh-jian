@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>{{ title or 'Web 服务' }}</title>
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
+  <body>
+    <header>
+      <h1>{{ title or 'Web 服务' }}</h1>
+      <nav>
+        <a href="{{ url_for('index') }}">首页</a> |
+        {% if user %}
+          <a href="{{ url_for('items') }}">数据</a> |
+          <a href="{{ url_for('search') }}">查询</a> |
+          <a href="{{ url_for('logout') }}">登出({{ user['username'] }})</a>
+        {% else %}
+          <a href="{{ url_for('login') }}">登录</a> |
+          <a href="{{ url_for('register') }}">注册</a>
+        {% endif %}
+      </nav>
+      <hr/>
+    </header>
+    <main>
+      {% with messages = get_flashed_messages() %}
+        {% if messages %}
+          <ul class="flashes">
+            {% for m in messages %}
+              <li>{{ m }}</li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+      {% endwith %}
+      {% block content %}{% endblock %}
+    </main>
+    <footer>
+      <hr/>
+      <small>示例 Web 服务</small>
+    </footer>
+  </body>
+</html>

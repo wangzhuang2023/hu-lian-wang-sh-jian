@@ -1,0 +1,16 @@
+{% extends 'base.html' %}
+{% block content %}
+  <h2>查询</h2>
+  <form method="get">
+    <input name="q" value="{{ q }}" placeholder="请输入关键词">
+    <button type="submit">搜索</button>
+  </form>
+  <h3>结果</h3>
+  <ul>
+    {% for it in results %}
+      <li><strong>{{ it['title'] }}</strong>: {{ it['content'] }}</li>
+    {% else %}
+      <li>无匹配结果</li>
+    {% endfor %}
+  </ul>
+{% endblock %}

@@ -1,0 +1,11 @@
+{% extends 'base.html' %}
+{% block content %}
+  <h2>全部数据</h2>
+  <ul>
+    {% for it in items %}
+      <li><strong>{{ it['title'] }}</strong>: {{ it['content'] }}</li>
+    {% else %}
+      <li>暂无数据</li>
+    {% endfor %}
+  </ul>
+{% endblock %}

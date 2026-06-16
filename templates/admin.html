@@ -1,0 +1,14 @@
+{% extends 'base.html' %}
+{% block content %}
+  <h2>用户管理</h2>
+  <table>
+    <tr><th>ID</th><th>用户名</th><th>管理员</th></tr>
+    {% for u in users %}
+      <tr>
+        <td>{{ u['id'] }}</td>
+        <td>{{ u['username'] }}</td>
+        <td>{{ '是' if u['is_admin'] else '否' }}</td>
+      </tr>
+    {% endfor %}
+  </table>
+{% endblock %}
