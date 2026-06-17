@@ -173,6 +173,24 @@ class OutputFormatter:
             return f"聊天> 已连接到 {kwargs.get('host', '?')}:{kwargs.get('port', '?')}"
         elif event == "chat_disconnect":
             return f"聊天> 连接已断开"
+        elif event == "dgram_sent":
+            return (f"数据报文发送完成: 分片={kwargs.get('fragments', 0)}, "
+                    f"有效载荷={format_bytes(kwargs.get('payload_size', 0))}, "
+                    f"总字节={format_bytes(kwargs.get('bytes_sent', 0))}, "
+                    f"耗时={human_time(kwargs.get('elapsed', 0))}")
+        elif event == "dgram_recv":
+            return (f"收到报文 #{kwargs.get('index', '?')}: "
+                    f"{format_bytes(kwargs.get('size', 0))} "
+                    f"({kwargs.get('frags_received', 0)}/{kwargs.get('total_frags', 0)} 分片)")
+        elif event == "dgram_listen_start":
+            return f"数据报文监听启动 {kwargs.get('host', '?')}:{kwargs.get('port', '?')}"
+        elif event == "dgram_listen_stop":
+            return f"数据报文监听已停止 — {kwargs.get('summary', '')}"
+        elif event == "udp_binary_sent":
+            return (f"UDP 二进制发送至 {kwargs.get('host', '?')}:{kwargs.get('port', '?')}: "
+                    f"{format_bytes(kwargs.get('payload', 0))} ({kwargs.get('bytes', 0)} 字节)")
+        elif event == "udp_binary_recv":
+            return f"UDP 二进制接收: {format_bytes(kwargs.get('size', 0))} 来自 {kwargs.get('addr', '?')}"
         elif event == "scan_start":
             return f"扫描 {kwargs.get('target', '?')} 端口 {kwargs.get('start', '?')}-{kwargs.get('end', '?')} (超时={kwargs.get('timeout', '?')}s, {kwargs.get('workers', '?')} 并发)"
         elif event == "scan_result":
@@ -723,6 +741,204 @@ def cmd_udp_multicast(args):
             time.sleep(args.interval)
 
 
+def cmd_udp_dgram_send(args):
+    """处理 'udp dgram-send' 子命令 — 发送数据报文（支持分片/ACK）"""
+    fmt = OutputFormatter(json_mode=args.json)
+    stats = StatsCounter() if not args.json else None
+
+    # 获取数据
+    if args.data == '-':
+        data = sys.stdin.buffer.read()
+    elif args.file:
+        if not os.path.isfile(args.file):
+            print(f"错误: 文件不存在: {args.file}", file=sys.stderr)
+            sys.exit(1)
+        with open(args.file, 'rb') as f:
+            data = f.read()
+    elif args.message:
+        data = args.message.encode(args.encoding, errors='replace')
+    else:
+        data = sys.stdin.buffer.read()
+
+    if not data:
+        print("错误: 无数据可发送", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.json:
+        print(f"发送 {format_bytes(len(data))} 到 {args.host}:{args.port} "
+              f"(MTU={args.mtu}, ACK={args.ack}, 分片阈值={args.mtu - 18}B)",
+              file=sys.stderr)
+
+    try:
+        result = NetworkCore.udp_send_datagram(
+            host=args.host,
+            port=args.port,
+            data=data,
+            mtu=args.mtu,
+            require_ack=args.ack,
+            ack_timeout=args.ack_timeout,
+            stats=stats,
+        )
+    except Exception as e:
+        fmt.log("error", message=str(e))
+        sys.exit(1)
+
+    if args.json:
+        fmt.log("dgram_sent", **result)
+    else:
+        print(f"\n发送完成:")
+        print(f"  有效载荷: {format_bytes(result['payload_size'])}")
+        print(f"  分片数:   {result['fragments']}")
+        print(f"  总字节:   {format_bytes(result['bytes_sent'])}")
+        print(f"  耗时:     {human_time(result['elapsed'])}")
+        if args.ack:
+            print(f"  ACK 确认: {result.get('acked', 0)}/{result['fragments']}")
+
+
+def cmd_udp_dgram_recv(args):
+    """处理 'udp dgram-recv' 子命令 — 接收数据报文（自动重组）"""
+    fmt = OutputFormatter(json_mode=args.json)
+    stats = StatsCounter() if not args.json else None
+    messages_received = [0]  # 用列表以便在闭包中修改
+    total_bytes = [0]
+
+    def on_message(addr, data, meta):
+        messages_received[0] += 1
+        total_bytes[0] += len(data)
+        if args.output:
+            # 保存到文件
+            os.makedirs(args.output, exist_ok=True)
+            fname = f"dgram_{addr[0].replace(':', '_')}_{addr[1]}_{meta['seq']}.bin"
+            fpath = os.path.join(args.output, fname)
+            with open(fpath, 'wb') as f:
+                f.write(data)
+            if not args.json:
+                print(f"[{fmt._ts()}] 收到消息 #{messages_received[0]}: "
+                      f"{format_bytes(len(data))} (分片={meta['frags_received']}/{meta['total_frags']}) "
+                      f"-> {fpath}")
+        elif args.json:
+            fmt.log("dgram_recv", addr=f"{addr[0]}:{addr[1]}",
+                    size=len(data), seq=meta['seq'],
+                    frags_received=meta['frags_received'],
+                    total_frags=meta['total_frags'],
+                    index=messages_received[0])
+        else:
+            # 尝试显示文本内容
+            try:
+                text = data.decode(args.encoding, errors='replace')
+                if len(text) > 500:
+                    text = text[:500] + f"\n... (截断，共 {len(data)} 字节)"
+            except Exception:
+                text = f"<二进制数据 {len(data)} 字节>"
+            print(f"\n[{fmt._ts()}] 消息 #{messages_received[0]} "
+                  f"({format_bytes(len(data))}, {meta['frags_received']}/{meta['total_frags']} 分片):")
+            print(f"  来源: {addr[0]}:{addr[1]}")
+            print(f"  内容: {text}")
+
+    fmt.log("dgram_listen_start", host=args.bind, port=args.port)
+
+    try:
+        NetworkCore.udp_recv_datagram(
+            port=args.port,
+            stop_event=_stop_event,
+            bind_host=args.bind,
+            timeout=args.timeout,
+            send_ack=args.ack,
+            stats=stats,
+            on_message=on_message,
+        )
+    except Exception as e:
+        fmt.log("error", message=str(e))
+
+    if stats:
+        s = stats.snapshot()
+    else:
+        s = {"sent_bytes": 0, "sent_packets": 0, "recv_bytes": 0, "recv_packets": 0}
+    summary = (f"接收 {format_bytes(s['recv_bytes'])}/{s['recv_packets']}包, "
+               f"{messages_received[0]} 条完整消息")
+    fmt.log("dgram_listen_stop", summary=summary)
+
+
+def cmd_udp_binary_send(args):
+    """处理 'udp binary-send' 子命令 — 发送原始二进制数据"""
+    fmt = OutputFormatter(json_mode=args.json)
+    stats = StatsCounter() if not args.json else None
+
+    if args.data == '-':
+        data = sys.stdin.buffer.read()
+    elif args.file:
+        if not os.path.isfile(args.file):
+            print(f"错误: 文件不存在: {args.file}", file=sys.stderr)
+            sys.exit(1)
+        with open(args.file, 'rb') as f:
+            data = f.read()
+    else:
+        print("错误: 需要 --data 或 --file 指定数据源", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        sent = NetworkCore.udp_send_binary(
+            host=args.host,
+            port=args.port,
+            data=data,
+            stats=stats,
+        )
+        if args.json:
+            fmt.log("udp_binary_sent", host=args.host, port=args.port,
+                    bytes=sent, payload=len(data))
+        else:
+            print(f"已发送 {format_bytes(len(data))} ({sent} 字节) 到 {args.host}:{args.port}")
+    except Exception as e:
+        fmt.log("error", message=str(e))
+        sys.exit(1)
+
+
+def cmd_udp_binary_recv(args):
+    """处理 'udp binary-recv' 子命令 — 接收原始二进制数据"""
+    fmt = OutputFormatter(json_mode=args.json)
+    stats = StatsCounter() if not args.json else None
+
+    def on_data(addr, data):
+        if args.output:
+            os.makedirs(args.output, exist_ok=True)
+            fname = f"udp_{addr[0].replace(':', '_')}_{addr[1]}.bin"
+            fpath = os.path.join(args.output, fname)
+            with open(fpath, 'wb') as f:
+                f.write(data)
+            if not args.json:
+                print(f"[{fmt._ts()}] 收到 {format_bytes(len(data))} 来自 {addr[0]}:{addr[1]} -> {fpath}")
+        elif args.json:
+            fmt.log("udp_binary_recv", addr=f"{addr[0]}:{addr[1]}", size=len(data))
+        else:
+            hex_preview = data[:64].hex(' ')
+            if len(data) > 64:
+                hex_preview += f" ... ({len(data)} 字节)"
+            print(f"[{fmt._ts()}] 收到 {format_bytes(len(data))} 来自 {addr[0]}:{addr[1]}:")
+            print(f"  {hex_preview}")
+
+    fmt.log("dgram_listen_start", host=args.bind, port=args.port)
+
+    try:
+        NetworkCore.udp_recv_binary(
+            port=args.port,
+            stop_event=_stop_event,
+            bind_host=args.bind,
+            timeout=args.timeout,
+            buffer_size=args.buffer_size,
+            stats=stats,
+            on_data=on_data,
+        )
+    except Exception as e:
+        fmt.log("error", message=str(e))
+
+    if stats:
+        s = stats.snapshot()
+        summary = f"接收 {format_bytes(s['recv_bytes'])}/{s['recv_packets']}包"
+    else:
+        summary = ""
+    fmt.log("dgram_listen_stop", summary=summary)
+
+
 # ========================================================================
 # argparse 解析器构建
 # ========================================================================
@@ -870,6 +1086,50 @@ def build_parser() -> argparse.ArgumentParser:
     add_encoding_arg(p)
     add_json_arg(p)
     p.set_defaults(func=cmd_udp_multicast)
+
+    # udp dgram-send — 数据报文发送（分片/ACK）
+    p = udp_sub.add_parser('dgram-send', help='UDP 数据报文发送 (支持分片与 ACK)')
+    p.add_argument('--host', '-H', required=True, help='目标主机名或 IP')
+    p.add_argument('--port', '-p', type=int, required=True, help='目标端口 (1-65535)')
+    p.add_argument('--data', '-d', default=None, help='要发送的数据 (使用 "-" 从 stdin 读取)')
+    p.add_argument('--message', '-m', default=None, help='要发送的文本消息')
+    p.add_argument('--file', '-f', default=None, help='从文件读取数据')
+    p.add_argument('--mtu', type=int, default=1400, help='最大传输单元 (默认: 1400)')
+    p.add_argument('--ack', action='store_true', help='要求接收方发送 ACK 确认')
+    p.add_argument('--ack-timeout', type=float, default=3.0, help='ACK 等待超时秒数 (默认: 3.0)')
+    add_encoding_arg(p)
+    add_json_arg(p)
+    p.set_defaults(func=cmd_udp_dgram_send)
+
+    # udp dgram-recv — 数据报文接收（重组/ACK）
+    p = udp_sub.add_parser('dgram-recv', help='UDP 数据报文接收 (自动重组)')
+    p.add_argument('--port', '-p', type=int, required=True, help='监听端口 (1-65535)')
+    p.add_argument('--bind', '-b', default='0.0.0.0', help='绑定地址 (默认: 0.0.0.0)')
+    p.add_argument('--output', '-o', default=None, help='保存目录 (默认: 输出到终端)')
+    p.add_argument('--ack', action='store_true', help='发送 ACK 确认给发送方')
+    add_timeout_arg(p, default=0.0, help_text='监听超时秒数 (0=永久)')
+    add_encoding_arg(p)
+    add_json_arg(p)
+    p.set_defaults(func=cmd_udp_dgram_recv)
+
+    # udp binary-send — 原始二进制发送
+    p = udp_sub.add_parser('binary-send', help='UDP 原始二进制数据发送')
+    p.add_argument('--host', '-H', required=True, help='目标主机名或 IP')
+    p.add_argument('--port', '-p', type=int, required=True, help='目标端口 (1-65535)')
+    p.add_argument('--data', '-d', default=None, help='要发送的数据 (使用 "-" 从 stdin 读取)')
+    p.add_argument('--file', '-f', default=None, help='从文件读取二进制数据')
+    add_json_arg(p)
+    p.set_defaults(func=cmd_udp_binary_send)
+
+    # udp binary-recv — 原始二进制接收
+    p = udp_sub.add_parser('binary-recv', help='UDP 原始二进制数据接收')
+    p.add_argument('--port', '-p', type=int, required=True, help='监听端口 (1-65535)')
+    p.add_argument('--bind', '-b', default='0.0.0.0', help='绑定地址 (默认: 0.0.0.0)')
+    p.add_argument('--output', '-o', default=None, help='保存目录 (默认: 输出十六进制预览)')
+    p.add_argument('--buffer-size', type=int, default=65536, help='接收缓冲区大小 (默认: 65536)')
+    add_timeout_arg(p, default=0.0, help_text='监听超时秒数 (0=永久)')
+    add_json_arg(p)
+    p.set_defaults(func=cmd_udp_binary_recv)
 
     return parser
 

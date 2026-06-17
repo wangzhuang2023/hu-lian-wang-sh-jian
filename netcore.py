@@ -254,6 +254,125 @@ def unpack_file_header(sock: socket.socket) -> Tuple[str, int]:
 
 
 # ========================================================================
+# 数据报文协议 (Datagram Protocol) 辅助函数
+# ========================================================================
+
+# 报文格式:
+#   [2B magic 0xD46D][1B ver][1B flags][4B seq][2B total_frags]
+#   [2B frag_index][2B data_len][N bytes payload][4B CRC32]
+# 头部: 14 字节, CRC: 4 字节, 总计开销: 18 字节
+
+_DGRAM_MAGIC = b'\xD4\x6D'
+_DGRAM_HEADER_FMT = '!2sBB I H H H'
+_DGRAM_HEADER_SIZE = struct.calcsize(_DGRAM_HEADER_FMT)  # 14
+_DGRAM_CRC_SIZE = 4
+_DGRAM_OVERHEAD = _DGRAM_HEADER_SIZE + _DGRAM_CRC_SIZE   # 18
+
+# ACK 报文格式:
+#   [2B magic 0xD46D][1B ver=0xFF][1B flags=0xA0][4B seq][2B frag_index]
+_ACK_MAGIC = b'\xD4\x6D'
+_ACK_FMT = '!2sBB I H'
+_ACK_SIZE = struct.calcsize(_ACK_FMT)  # 10
+
+# 报文标志位
+_DGRAM_FLAG_FRAGMENT = 0x01   # 是分片报文
+_DGRAM_FLAG_LAST     = 0x02   # 最后一片
+_DGRAM_FLAG_ACK      = 0x80   # 需要 ACK 确认
+
+
+def _build_datagram_packet(
+    seq: int,
+    total_frags: int,
+    frag_index: int,
+    payload: bytes,
+    flags: int = 1,
+    version: int = 1,
+) -> bytes:
+    """构建数据报文（含头部和 CRC32 校验）"""
+    header = struct.pack(
+        _DGRAM_HEADER_FMT,
+        _DGRAM_MAGIC,
+        version,
+        flags,
+        seq & 0xFFFFFFFF,
+        total_frags & 0xFFFF,
+        frag_index & 0xFFFF,
+        len(payload) & 0xFFFF,
+    )
+    crc = struct.pack('!I', _crc32(header + payload) & 0xFFFFFFFF)
+    return header + payload + crc
+
+
+def _parse_datagram_packet(data: bytes) -> Optional[Dict[str, Any]]:
+    """解析数据报文，返回字段字典。无效报文返回 None。"""
+    if len(data) < _DGRAM_OVERHEAD:
+        return None
+
+    try:
+        magic, ver, flags, seq, total_frags, frag_index, data_len = struct.unpack(
+            _DGRAM_HEADER_FMT, data[:_DGRAM_HEADER_SIZE]
+        )
+    except struct.error:
+        return None
+
+    if magic != _DGRAM_MAGIC:
+        return None
+
+    payload_end = _DGRAM_HEADER_SIZE + data_len
+    if payload_end + _DGRAM_CRC_SIZE > len(data):
+        return None
+
+    payload = data[_DGRAM_HEADER_SIZE:payload_end]
+    received_crc = struct.unpack('!I', data[payload_end:payload_end + _DGRAM_CRC_SIZE])[0]
+
+    # 校验 CRC
+    expected_crc = _crc32(data[:payload_end]) & 0xFFFFFFFF
+    if received_crc != expected_crc:
+        return None
+
+    return {
+        'version': ver,
+        'flags': flags,
+        'seq': seq,
+        'total_frags': total_frags,
+        'frag_index': frag_index,
+        'data_len': data_len,
+        'payload': payload,
+    }
+
+
+def _build_ack_packet(seq: int, frag_index: int) -> bytes:
+    """构建 ACK 确认报文"""
+    return struct.pack(
+        _ACK_FMT,
+        _ACK_MAGIC,
+        0xFF,  # ACK 版本标记
+        0xA0,  # ACK 标志
+        seq & 0xFFFFFFFF,
+        frag_index & 0xFFFF,
+    )
+
+
+def _is_ack_packet(data: bytes, expected_seq: int, expected_frag: int) -> bool:
+    """检查是否为对应报文的 ACK"""
+    if len(data) < _ACK_SIZE:
+        return False
+    try:
+        magic, ver, flags, seq, frag = struct.unpack(_ACK_FMT, data[:_ACK_SIZE])
+    except struct.error:
+        return False
+    return (magic == _ACK_MAGIC and ver == 0xFF and flags == 0xA0
+            and seq == (expected_seq & 0xFFFFFFFF)
+            and frag == (expected_frag & 0xFFFF))
+
+
+def _crc32(data: bytes) -> int:
+    """计算 CRC32 校验值"""
+    import zlib
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+# ========================================================================
 # StatsCounter — 线程安全的收发统计
 # ========================================================================
 
@@ -1169,6 +1288,346 @@ class NetworkCore:
             except socket.timeout:
                 continue
             except OSError:
+                break
+
+        sock.close()
+
+    # ======================== 数据报文协议 (Datagram Protocol) ========================
+
+    @staticmethod
+    def udp_send_datagram(
+        host: str,
+        port: int,
+        data: bytes,
+        mtu: int = 1400,
+        require_ack: bool = False,
+        ack_timeout: float = 3.0,
+        stats: Optional[StatsCounter] = None,
+    ) -> Dict[str, Any]:
+        """
+        UDP 发送数据报文，自动分片大于 MTU 的数据。
+
+        报文格式 (每片):
+          [2B magic 0xD46D][1B ver][1B flags][4B seq][2B total_frags]
+          [2B frag_index][2B data_len][N bytes payload][4B CRC32]
+
+        头部大小: 14 字节，尾部 CRC32: 4 字节
+        每片最大有效载荷: mtu - 18
+
+        参数:
+            host: 目标地址
+            port: 目标端口
+            data: 要发送的原始字节数据
+            mtu: 最大传输单元 (默认 1400)
+            require_ack: 是否要求确认
+            ack_timeout: ACK 超时秒数
+            stats: 可选的统计计数器
+
+        返回:
+            {'fragments': int, 'bytes_sent': int, 'elapsed': float,
+             'acked': int (if require_ack)}
+        """
+        # 解析目标地址
+        addrinfo = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+        sock = None
+        for family, socktype, proto, canonname, sockaddr in addrinfo:
+            try:
+                sock = socket.socket(family, socktype, proto)
+                break
+            except OSError:
+                if sock:
+                    sock.close()
+                    sock = None
+                continue
+        if sock is None:
+            raise ConnectionError(f"无法创建 UDP 套接字发送到 {host}:{port}")
+
+        max_payload = mtu - 18  # 14B header + 4B CRC
+        total_frags = max(1, (len(data) + max_payload - 1) // max_payload)
+        seq_base = int(time.time() * 1000) & 0xFFFFFFFF
+
+        start_time = time.time()
+        total_sent = 0
+        acks_received = 0
+
+        try:
+            # 如果需要 ACK，设置接收超时
+            if require_ack:
+                sock.settimeout(ack_timeout)
+
+            for frag_idx in range(total_frags):
+                start = frag_idx * max_payload
+                end = min(start + max_payload, len(data))
+                chunk = data[start:end]
+
+                # 构建报文
+                packet = _build_datagram_packet(
+                    seq=seq_base,
+                    total_frags=total_frags,
+                    frag_index=frag_idx,
+                    payload=chunk,
+                    flags=(1 if frag_idx < total_frags - 1 else 3),  # bit0=fragment, bit1=last
+                )
+                sock.sendto(packet, sockaddr)
+                total_sent += len(packet)
+                if stats:
+                    stats.add_sent(len(packet))
+
+                # 等待 ACK
+                if require_ack:
+                    try:
+                        ack_data, ack_addr = sock.recvfrom(256)
+                        if stats:
+                            stats.add_recv(len(ack_data))
+                        if _is_ack_packet(ack_data, seq_base, frag_idx):
+                            acks_received += 1
+                    except socket.timeout:
+                        pass  # ACK 超时，继续发送下一片
+
+        finally:
+            sock.close()
+
+        elapsed = time.time() - start_time
+        result: Dict[str, Any] = {
+            "fragments": total_frags,
+            "bytes_sent": total_sent,
+            "elapsed": elapsed,
+            "payload_size": len(data),
+        }
+        if require_ack:
+            result["acked"] = acks_received
+        return result
+
+    @staticmethod
+    def udp_recv_datagram(
+        port: int,
+        stop_event: threading.Event,
+        bind_host: str = "0.0.0.0",
+        timeout: float = 0.0,
+        send_ack: bool = True,
+        stats: Optional[StatsCounter] = None,
+        on_message: Optional[Callable[[Tuple[str, int], bytes, Dict[str, Any]], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """
+        UDP 接收数据报文，自动重组分片。
+
+        参数:
+            port: 监听端口
+            stop_event: 停止事件
+            bind_host: 绑定地址
+            timeout: 总超时秒数
+            send_ack: 是否发送 ACK 确认
+            stats: 可选的统计计数器
+            on_message: 完整消息回调 on_message(addr, data, meta)
+                        meta 包含: {'seq': int, 'total_frags': int, 'frags_received': int}
+            on_error: 错误回调
+        """
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except (AttributeError, OSError):
+                pass
+            sock.bind(("::", port))
+        except OSError:
+            if sock:
+                sock.close()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((bind_host if bind_host != "0.0.0.0" else "0.0.0.0", port))
+
+        sock.settimeout(1.0)
+        start_time = time.time()
+
+        # 重组缓冲区: {(addr_key, seq): {total: N, frags: {idx: bytes}, last_seen: time}}
+        reassembly: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+        reassembly_timeout = 30.0  # 30 秒后丢弃不完整的消息
+
+        while not stop_event.is_set():
+            if timeout > 0 and (time.time() - start_time) >= timeout:
+                break
+
+            try:
+                raw_data, addr = sock.recvfrom(65536)
+                if stats:
+                    stats.add_recv(len(raw_data))
+            except socket.timeout:
+                # 清理过期的不完整消息
+                now = time.time()
+                expired_keys = [
+                    k for k, v in reassembly.items()
+                    if now - v.get('last_seen', 0) > reassembly_timeout
+                ]
+                for k in expired_keys:
+                    del reassembly[k]
+                continue
+            except OSError:
+                break
+
+            # 解析报文
+            packet_info = _parse_datagram_packet(raw_data)
+            if packet_info is None:
+                continue  # 无效报文，静默丢弃
+
+            # 发送 ACK
+            if send_ack and packet_info['flags'] & 0x01:  # 是分片报文
+                ack_packet = _build_ack_packet(
+                    packet_info['seq'],
+                    packet_info['frag_index'],
+                )
+                try:
+                    sock.sendto(ack_packet, addr)
+                    if stats:
+                        stats.add_sent(len(ack_packet))
+                except OSError:
+                    pass
+
+            # 如果不分片，直接回调
+            if packet_info['total_frags'] == 1:
+                if on_message:
+                    on_message(addr, packet_info['payload'], {
+                        'seq': packet_info['seq'],
+                        'total_frags': 1,
+                        'frags_received': 1,
+                        'frag_index': 0,
+                    })
+                continue
+
+            # 分片重组
+            key = (addr[0], addr[1], packet_info['seq'])
+            if key not in reassembly:
+                reassembly[key] = {
+                    'total': packet_info['total_frags'],
+                    'frags': {},
+                    'last_seen': time.time(),
+                    'addr': addr,
+                }
+            else:
+                reassembly[key]['last_seen'] = time.time()
+
+            buf = reassembly[key]
+            buf['frags'][packet_info['frag_index']] = packet_info['payload']
+
+            # 检查是否收集完所有分片
+            if len(buf['frags']) == buf['total']:
+                # 按顺序组装
+                ordered = b''.join(
+                    buf['frags'][i] for i in range(buf['total'])
+                    if i in buf['frags']
+                )
+                if on_message:
+                    on_message(buf['addr'], ordered, {
+                        'seq': packet_info['seq'],
+                        'total_frags': buf['total'],
+                        'frags_received': len(buf['frags']),
+                    })
+                del reassembly[key]
+
+        sock.close()
+
+    # ======================== UDP 二进制发送 ========================
+
+    @staticmethod
+    def udp_send_binary(
+        host: str,
+        port: int,
+        data: bytes,
+        stats: Optional[StatsCounter] = None,
+    ) -> int:
+        """
+        UDP 发送原始二进制数据。
+
+        参数:
+            host: 目标地址
+            port: 目标端口
+            data: 原始字节数据
+            stats: 可选的统计计数器
+
+        返回:
+            发送的字节数
+        """
+        addrinfo = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+        sock = None
+        for family, socktype, proto, canonname, sockaddr in addrinfo:
+            try:
+                sock = socket.socket(family, socktype, proto)
+                break
+            except OSError:
+                if sock:
+                    sock.close()
+                    sock = None
+                continue
+        if sock is None:
+            raise ConnectionError(f"无法创建 UDP 套接字发送到 {host}:{port}")
+
+        try:
+            sent = sock.sendto(data, sockaddr)
+            if stats:
+                stats.add_sent(sent)
+            return sent
+        finally:
+            sock.close()
+
+    @staticmethod
+    def udp_recv_binary(
+        port: int,
+        stop_event: threading.Event,
+        bind_host: str = "0.0.0.0",
+        timeout: float = 0.0,
+        buffer_size: int = 65536,
+        stats: Optional[StatsCounter] = None,
+        on_data: Optional[Callable[[Tuple[str, int], bytes], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """
+        UDP 接收原始二进制数据报。
+
+        参数:
+            port: 监听端口
+            stop_event: 停止事件
+            bind_host: 绑定地址
+            timeout: 总超时秒数
+            buffer_size: 接收缓冲区大小
+            stats: 可选的统计计数器
+            on_data: 收到数据回调 on_data(addr, raw_bytes)
+            on_error: 错误回调
+        """
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except (AttributeError, OSError):
+                pass
+            sock.bind(("::", port))
+        except OSError:
+            if sock:
+                sock.close()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((bind_host if bind_host != "0.0.0.0" else "0.0.0.0", port))
+
+        sock.settimeout(1.0)
+        start_time = time.time()
+
+        while not stop_event.is_set():
+            if timeout > 0 and (time.time() - start_time) >= timeout:
+                break
+            try:
+                data, addr = sock.recvfrom(buffer_size)
+                if stats:
+                    stats.add_recv(len(data))
+                if on_data:
+                    on_data(addr, data)
+            except socket.timeout:
+                continue
+            except OSError as e:
+                if on_error:
+                    on_error(f"UDP 接收错误: {e}")
                 break
 
         sock.close()
