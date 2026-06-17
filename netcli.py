@@ -155,6 +155,24 @@ class OutputFormatter:
                     f"({kwargs.get('throughput_mbps', 0):.2f} Mbps)")
         elif event == "file_recv_error":
             return f"文件接收错误: {kwargs.get('error', '?')}"
+        elif event == "listen_start":
+            return f"TCP 端口监听启动 {kwargs.get('host', '?')}:{kwargs.get('port', '?')} (持续={kwargs.get('keep_open', False)}, hex={kwargs.get('hex', False)}, 回复={kwargs.get('reply', False)})"
+        elif event == "listen_stop":
+            return f"TCP 监听已停止 — {kwargs.get('summary', '')}"
+        elif event == "listen_connect":
+            addr = kwargs.get('addr', '?')
+            if isinstance(addr, tuple):
+                addr = f"{addr[0]}:{addr[1]}"
+            return f"监听> 新连接: {addr}"
+        elif event == "listen_disconnect":
+            addr = kwargs.get('addr', '?')
+            if isinstance(addr, tuple):
+                addr = f"{addr[0]}:{addr[1]}"
+            return f"监听> 连接断开: {addr}"
+        elif event == "chat_connect":
+            return f"聊天> 已连接到 {kwargs.get('host', '?')}:{kwargs.get('port', '?')}"
+        elif event == "chat_disconnect":
+            return f"聊天> 连接已断开"
         elif event == "scan_start":
             return f"扫描 {kwargs.get('target', '?')} 端口 {kwargs.get('start', '?')}-{kwargs.get('end', '?')} (超时={kwargs.get('timeout', '?')}s, {kwargs.get('workers', '?')} 并发)"
         elif event == "scan_result":
@@ -315,6 +333,147 @@ def cmd_tcp_client(args):
     except Exception as e:
         fmt.log("tcp_client_error", error=str(e))
         sys.exit(1)
+
+
+def cmd_tcp_listen(args):
+    """处理 'tcp listen' 子命令 — 端口监听（类似 netcat -l）"""
+    fmt = OutputFormatter(json_mode=args.json)
+    stats = StatsCounter() if not args.json else None
+
+    def on_connect(addr):
+        fmt.log("listen_connect", addr=addr)
+
+    def on_disconnect(addr):
+        fmt.log("listen_disconnect", addr=addr)
+
+    def on_data(addr, data):
+        if args.hex:
+            # 十六进制转储格式
+            hex_str = data.hex(' ')
+            # 同时显示 ASCII 可打印字符
+            ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
+            msg = f"{hex_str}  |{ascii_str}|"
+        else:
+            # 尝试用指定编码解码
+            try:
+                msg = data.decode(args.encoding, errors='replace')
+            except Exception:
+                msg = data.hex(' ')
+        fmt.log("tcp_recv", addr=addr, message=msg)
+
+    def on_error(msg):
+        fmt.log("error", message=msg)
+
+    # 交互回复：从 stdin 读取一行发送回去
+    reply_lock = threading.Lock()
+
+    def get_reply():
+        if not args.reply:
+            return None
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                return None
+            return line.rstrip('\n').encode(args.encoding, errors='replace')
+        except Exception:
+            return None
+
+    fmt.log("listen_start", host=args.bind, port=args.port,
+            keep_open=args.keep_open, hex=args.hex, reply=args.reply)
+
+    # 如果启用交互回复，在另一个线程中提示用户
+    if args.reply:
+        print(f"交互回复模式已启用 (编码: {args.encoding})", file=sys.stderr)
+        print(f"输入回复内容后按回车发送，Ctrl+C 退出", file=sys.stderr)
+
+    try:
+        NetworkCore.tcp_listen(
+            port=args.port,
+            stop_event=_stop_event,
+            bind_host=args.bind,
+            encoding=args.encoding,
+            keep_open=args.keep_open,
+            timeout=args.timeout,
+            stats=stats,
+            on_connect=on_connect,
+            on_disconnect=on_disconnect,
+            on_data=on_data,
+            on_error=on_error,
+            get_reply=get_reply if args.reply else None,
+        )
+    except Exception as e:
+        fmt.log("error", message=str(e))
+
+    if stats:
+        s = stats.snapshot()
+        summary = (f"发送 {format_bytes(s['sent_bytes'])}/{s['sent_packets']}包, "
+                   f"接收 {format_bytes(s['recv_bytes'])}/{s['recv_packets']}包")
+    else:
+        summary = f"接收 {0} 字节" if not stats else ""
+    fmt.log("listen_stop", summary=summary)
+
+
+def cmd_tcp_chat(args):
+    """处理 'tcp chat' 子命令 — 交互式双向通信"""
+    fmt = OutputFormatter(json_mode=args.json)
+    stats = StatsCounter() if not args.json else None
+
+    def on_connect(host, port):
+        fmt.log("chat_connect", host=host, port=port)
+
+    def on_data(data):
+        # 输出到 stdout，加换行
+        try:
+            text = data.decode(args.encoding, errors='replace')
+        except Exception:
+            text = data.hex(' ')
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def on_disconnect():
+        fmt.log("chat_disconnect")
+
+    def on_error(msg):
+        fmt.log("error", message=msg)
+
+    def get_input():
+        """从 stdin 读取一行用户输入"""
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                return None
+            stripped = line.rstrip('\n')
+            if stripped == '\\q':
+                _stop_event.set()
+                return None
+            return (stripped + '\n').encode(args.encoding, errors='replace')
+        except Exception:
+            return None
+
+    if not args.json:
+        print(f"已连接到 {args.host}:{args.port} (输入 \\q 退出)", file=sys.stderr)
+
+    try:
+        NetworkCore.tcp_client_interactive(
+            host=args.host,
+            port=args.port,
+            stop_event=_stop_event,
+            encoding=args.encoding,
+            timeout=args.timeout,
+            stats=stats,
+            on_connect=on_connect,
+            on_data=on_data,
+            on_disconnect=on_disconnect,
+            on_error=on_error,
+            get_input=get_input,
+        )
+    except Exception as e:
+        fmt.log("error", message=str(e))
+
+    if not args.json and stats:
+        s = stats.snapshot()
+        print(f"\n会话结束 — 发送 {format_bytes(s['sent_bytes'])}/{s['sent_packets']}包, "
+              f"接收 {format_bytes(s['recv_bytes'])}/{s['recv_packets']}包", file=sys.stderr)
 
 
 def cmd_tcp_send_file(args):
@@ -633,6 +792,27 @@ def build_parser() -> argparse.ArgumentParser:
     add_timeout_arg(p, default=0.0, help_text='等待连接超时秒数 (0=永久)')
     add_json_arg(p)
     p.set_defaults(func=cmd_tcp_recv_file)
+
+    # tcp listen — 端口监听（netcat -l 模式）
+    p = tcp_sub.add_parser('listen', help='TCP 端口监听 (类似 nc -l)')
+    p.add_argument('--port', '-p', type=int, required=True, help='监听端口 (1-65535)')
+    p.add_argument('--bind', '-b', default='0.0.0.0', help='绑定地址 (默认: 0.0.0.0)')
+    p.add_argument('--keep-open', '-k', action='store_true', help='持续监听，断开后接受新连接')
+    p.add_argument('--reply', '-r', action='store_true', help='交互回复模式 (从 stdin 读取回复)')
+    p.add_argument('--hex', action='store_true', help='以十六进制转储格式显示数据')
+    add_timeout_arg(p, default=0.0, help_text='总监听超时秒数 (0=永久)')
+    add_encoding_arg(p)
+    add_json_arg(p)
+    p.set_defaults(func=cmd_tcp_listen)
+
+    # tcp chat — 交互式双向通信
+    p = tcp_sub.add_parser('chat', help='TCP 交互式聊天')
+    p.add_argument('--host', '-H', required=True, help='目标主机名或 IP')
+    p.add_argument('--port', '-p', type=int, required=True, help='目标端口 (1-65535)')
+    add_timeout_arg(p, default=5.0, help_text='连接超时秒数')
+    add_encoding_arg(p)
+    add_json_arg(p)
+    p.set_defaults(func=cmd_tcp_chat)
 
     # tcp scan
     p = tcp_sub.add_parser('scan', help='TCP 端口扫描')

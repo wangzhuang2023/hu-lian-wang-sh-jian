@@ -522,6 +522,200 @@ class NetworkCore:
                 pass
             raise ConnectionError(f"TCP 客户端错误: {e}")
 
+    # ======================== TCP 监听 (Netcat -l 模式) ========================
+
+    @staticmethod
+    def tcp_listen(
+        port: int,
+        stop_event: threading.Event,
+        bind_host: str = "0.0.0.0",
+        encoding: str = "UTF-8",
+        keep_open: bool = False,
+        timeout: float = 0.0,
+        read_timeout: float = 1.0,
+        stats: Optional[StatsCounter] = None,
+        on_connect: Optional[Callable[[Tuple[str, int]], None]] = None,
+        on_disconnect: Optional[Callable[[Tuple[str, int]], None]] = None,
+        on_data: Optional[Callable[[Tuple[str, int], bytes], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
+        get_reply: Optional[Callable[[], Optional[bytes]]] = None,
+    ) -> None:
+        """
+        TCP 端口监听（类似 netcat -l），支持单连接或持续监听模式。
+
+        参数:
+            port: 监听端口
+            stop_event: 停止事件
+            bind_host: 绑定地址
+            encoding: 默认编解码（仅用于日志，on_data 回调接收原始 bytes）
+            keep_open: True=持续接受新连接，False=第一个连接断开后退出
+            timeout: 总超时秒数（0=永久）
+            read_timeout: 每次 recv 的超时（用于检查 stop_event）
+            stats: 可选的统计计数器
+            on_connect: 客户端连接回调
+            on_disconnect: 客户端断开回调
+            on_data: 收到数据回调，参数为 (addr, raw_bytes)
+            on_error: 错误回调
+            get_reply: 可选的回复数据回调，返回 bytes 发送回客户端；返回 None 表示不回复
+        """
+        # 创建监听套接字（支持 IPv6 双栈）
+        server = None
+        try:
+            server = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except (AttributeError, OSError):
+                pass
+            server.bind(("::", port))
+        except OSError:
+            if server:
+                server.close()
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((bind_host if bind_host != "0.0.0.0" else "0.0.0.0", port))
+
+        server.listen(1)
+        start_time = time.time()
+
+        while not stop_event.is_set():
+            # 检查总超时
+            if timeout > 0 and (time.time() - start_time) >= timeout:
+                break
+
+            try:
+                server.settimeout(1.0)
+                conn, addr = server.accept()
+            except socket.timeout:
+                continue
+            except OSError as e:
+                if not stop_event.is_set() and on_error:
+                    on_error(f"监听错误: {e}")
+                break
+
+            if on_connect:
+                on_connect(addr)
+
+            # 接收循环
+            try:
+                conn.settimeout(read_timeout)
+                while not stop_event.is_set():
+                    try:
+                        data = conn.recv(65536)
+                        if not data:
+                            break
+                        if stats:
+                            stats.add_recv(len(data))
+                        if on_data:
+                            on_data(addr, data)
+
+                        # 交互回复模式
+                        if get_reply:
+                            reply_data = get_reply()
+                            if reply_data:
+                                conn.sendall(reply_data)
+                                if stats:
+                                    stats.add_sent(len(reply_data))
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+            finally:
+                conn.close()
+                if on_disconnect:
+                    on_disconnect(addr)
+
+            if not keep_open:
+                break
+
+        server.close()
+
+    # ======================== TCP 交互客户端 ========================
+
+    @staticmethod
+    def tcp_client_interactive(
+        host: str,
+        port: int,
+        stop_event: threading.Event,
+        encoding: str = "UTF-8",
+        timeout: float = 5.0,
+        stats: Optional[StatsCounter] = None,
+        on_connect: Optional[Callable[[str, int], None]] = None,
+        on_data: Optional[Callable[[bytes], None]] = None,
+        on_disconnect: Optional[Callable[[], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
+        get_input: Optional[Callable[[], Optional[bytes]]] = None,
+    ) -> None:
+        """
+        TCP 交互客户端：连接后持续收发，直到连接断开或 stop_event。
+
+        参数:
+            host: 目标主机
+            port: 目标端口
+            stop_event: 停止事件
+            encoding: 默认编码（仅用于日志）
+            timeout: 连接超时
+            stats: 可选的统计计数器
+            on_connect: 连接成功回调 on_connect(host, port)
+            on_data: 收到数据回调 on_data(raw_bytes)
+            on_disconnect: 连接断开回调
+            on_error: 错误回调
+            get_input: 获取用户输入回调，返回 bytes 发送；返回 None 表示不发送
+        """
+        addrinfo = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        sock = None
+        last_error = None
+
+        for family, socktype, proto, canonname, sockaddr in addrinfo:
+            try:
+                sock = socket.socket(family, socktype, proto)
+                sock.settimeout(timeout)
+                sock.connect(sockaddr)
+                break
+            except OSError as e:
+                last_error = e
+                if sock:
+                    sock.close()
+                    sock = None
+                continue
+
+        if sock is None:
+            if on_error:
+                on_error(f"无法连接到 {host}:{port}: {last_error}")
+            return
+
+        if on_connect:
+            on_connect(sockaddr[0], sockaddr[1])
+
+        try:
+            sock.settimeout(1.0)
+            while not stop_event.is_set():
+                # 发送用户输入（如果有）
+                if get_input:
+                    input_data = get_input()
+                    if input_data:
+                        sock.sendall(input_data)
+                        if stats:
+                            stats.add_sent(len(input_data))
+
+                # 接收数据
+                try:
+                    data = sock.recv(65536)
+                    if not data:
+                        break
+                    if stats:
+                        stats.add_recv(len(data))
+                    if on_data:
+                        on_data(data)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+        finally:
+            sock.close()
+            if on_disconnect:
+                on_disconnect()
+
     # ======================== TCP 文件传输 ========================
 
     @staticmethod
