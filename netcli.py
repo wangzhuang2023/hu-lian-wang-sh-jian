@@ -943,6 +943,236 @@ def cmd_udp_binary_recv(args):
 # argparse 解析器构建
 # ========================================================================
 
+def cmd_status(args):
+    """处理 'status' 子命令 — 综合网络状态报告"""
+    fmt = OutputFormatter(json_mode=args.json)
+
+    if not args.json:
+        print("正在检测网络状态...\n", file=sys.stderr)
+
+    try:
+        status = NetworkCore.get_network_status(
+            connectivity_targets=None,
+            latency_targets=None,
+            timeout=args.timeout,
+        )
+    except Exception as e:
+        fmt.log("error", message=str(e))
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        return
+
+    # 人类可读报告
+    print("=" * 55)
+    print("  网络状态报告")
+    print("=" * 55)
+    print(f"  时间:     {status['timestamp']}")
+    print(f"  本机 IP:  {status['local_ip']}")
+    online_text = '[ONLINE]' if status['connectivity']['online'] else '[OFFLINE]'
+    print(f"  网络状态: {online_text}")
+
+    # 网络接口
+    print(f"\n── 网络接口 ({len(status['interfaces'])} 个) ──")
+    for iface in status['interfaces']:
+        print(f"  {iface['name']:<15} {iface['ip']:<25} {iface['family']}")
+
+    # 连通性
+    print(f"\n── 连通性检测 ({status['connectivity']['reachable_count']}/{status['connectivity']['total']} 可达) ──")
+    conn = status['connectivity']
+    for target, info in conn['results'].items():
+        icon = "[OK]" if info['reachable'] else "[FAIL]"
+        lat = f"{info['latency_ms']:.1f}ms" if info['reachable'] else "超时"
+        print(f"  {icon} {target:<20} {lat}")
+
+    # 延迟
+    print(f"\n── 延迟测量 ──")
+    for target, avg_ms in status['latency'].items():
+        print(f"  {target:<20} 平均 {avg_ms:.1f}ms")
+
+    print("=" * 55)
+
+
+def cmd_ping(args):
+    """处理 'ping' 子命令"""
+    fmt = OutputFormatter(json_mode=args.json)
+
+    if not args.json:
+        method = f"TCP:{args.tcp_port}" if args.tcp_port else "ICMP"
+        print(f"PING {args.host} ({method}) {args.count} 次...\n", file=sys.stderr)
+
+    try:
+        result = NetworkCore.ping_host(
+            host=args.host,
+            count=args.count,
+            timeout=args.timeout,
+            tcp_port=args.tcp_port,
+        )
+    except Exception as e:
+        fmt.log("error", message=str(e))
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+        return
+
+    # 实时显示每次结果
+    for i, t in enumerate(result['times_ms']):
+        if t >= 0:
+            print(f"  [{i+1}] {t:.1f} ms")
+        else:
+            print(f"  [{i+1}] 超时")
+
+    # 统计
+    print(f"\n--- {result['host']} ping 统计 ---")
+    print(f"  发送: {result['sent']}, 收到: {result['received']}, "
+          f"丢包: {result['loss_pct']}%")
+    if result['received'] > 0:
+        print(f"  最小: {result['min_ms']}ms, 平均: {result['avg_ms']}ms, "
+              f"最大: {result['max_ms']}ms, 标准差: {result['stddev_ms']}ms")
+
+
+def cmd_latency(args):
+    """处理 'latency' 子命令 — TCP 延迟测量"""
+    fmt = OutputFormatter(json_mode=args.json)
+
+    if not args.json:
+        print(f"测量 TCP 延迟到 {args.host}:{args.port} ({args.count} 次)...\n", file=sys.stderr)
+
+    try:
+        result = NetworkCore.measure_latency(
+            host=args.host,
+            port=args.port,
+            count=args.count,
+            timeout=args.timeout,
+        )
+    except Exception as e:
+        fmt.log("error", message=str(e))
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+        return
+
+    for i, t in enumerate(result['times_ms']):
+        bar = _latency_bar(t)
+        if t >= 0:
+            print(f"  [{i+1}] {t:7.1f} ms  {bar}")
+        else:
+            print(f"  [{i+1}]   超时  {bar}")
+
+    print(f"\n--- {result['host']}:{result['port']} 延迟统计 ---")
+    print(f"  最小: {result['min_ms']}ms, 平均: {result['avg_ms']}ms, "
+          f"最大: {result['max_ms']}ms, 标准差: {result['stddev_ms']}ms")
+
+
+def _latency_bar(ms: float, max_width: int = 20) -> str:
+    """延迟可视化条"""
+    if ms < 0:
+        return 'TIMEOUT'
+    width = min(int(ms / 10), max_width)
+    if ms < 30:
+        color = '#'  # 快
+    elif ms < 100:
+        color = '='  # 中
+    else:
+        color = '.'  # 慢
+    return color * (width + 1)
+
+
+def cmd_speed(args):
+    """处理 'speed' 子命令 — 带宽测速"""
+    fmt = OutputFormatter(json_mode=args.json)
+
+    if not args.json:
+        print(f"测速到 {args.host}:{args.port} (持续 {args.duration}s)...\n", file=sys.stderr)
+
+    def progress_cb(sent, elapsed):
+        if not args.json:
+            mbps = (sent * 8 / max(elapsed, 0.1) / 1_000_000)
+            bar_len = 20
+            filled = min(int(elapsed / args.duration * bar_len), bar_len)
+            bar = '█' * filled + '░' * (bar_len - filled)
+            sys.stderr.write(f"\r  [{bar}] {elapsed}s  {format_bytes(sent)}  {mbps:.1f} Mbps  ")
+            sys.stderr.flush()
+
+    try:
+        result = NetworkCore.measure_bandwidth(
+            host=args.host,
+            port=args.port,
+            duration=args.duration,
+            chunk_size=args.chunk_size,
+            timeout=args.timeout,
+            progress_cb=progress_cb,
+        )
+    except Exception as e:
+        fmt.log("error", message=str(e))
+        sys.exit(1)
+
+    if not args.json:
+        sys.stderr.write('\n')
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+        return
+
+    print(f"\n--- 带宽测试结果 ---")
+    print(f"  发送总量:   {format_bytes(result['bytes_sent'])}")
+    print(f"  持续时间:   {result['duration']}s")
+    print(f"  平均吞吐:   {result['throughput_mbps']} Mbps")
+    print(f"  峰值吞吐:   {result['throughput_mbps_peak']} Mbps")
+
+
+def cmd_monitor(args):
+    """处理 'monitor' 子命令 — 持续网络监控"""
+    fmt = OutputFormatter(json_mode=args.json)
+
+    if not args.json:
+        print(f"网络监控已启动 (间隔={args.interval}s, 按 Ctrl+C 退出)\n", file=sys.stderr)
+
+    iteration = 0
+    while not _stop_event.is_set():
+        iteration += 1
+        try:
+            conn = NetworkCore.check_connectivity(timeout=args.timeout)
+            online = conn['online']
+        except Exception:
+            online = False
+            conn = {'reachable_count': 0, 'total': 0}
+
+        ts = datetime.now().strftime('%H:%M:%S')
+        status_icon = "[+]" if online else "[-]"
+        if args.json:
+            entry = {
+                'timestamp': datetime.now().isoformat(),
+                'iteration': iteration,
+                'online': online,
+                'reachable': conn['reachable_count'],
+                'total': conn.get('total', 0),
+            }
+            print(json.dumps(entry, ensure_ascii=False))
+            sys.stdout.flush()
+        else:
+            line = f"[{ts}] {status_icon} 网络{'在线' if online else '离线'}"
+            if online:
+                line += f" ({conn['reachable_count']}/{conn.get('total', 0)} 可达)"
+            print(line)
+            sys.stdout.flush()
+
+        if args.max_count and iteration >= args.max_count:
+            break
+
+        # 分段等待以便响应 Ctrl+C
+        for _ in range(int(args.interval * 10)):
+            if _stop_event.is_set():
+                break
+            time.sleep(0.1)
+
+    if not args.json:
+        print(f"\n监控结束，共检查 {iteration} 次")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建完整的命令行参数解析器"""
     parser = argparse.ArgumentParser(
@@ -1130,6 +1360,49 @@ def build_parser() -> argparse.ArgumentParser:
     add_timeout_arg(p, default=0.0, help_text='监听超时秒数 (0=永久)')
     add_json_arg(p)
     p.set_defaults(func=cmd_udp_binary_recv)
+
+    # ---- 网络状态检测子命令 ----
+    # status
+    p = subparsers.add_parser('status', help='综合网络状态报告')
+    add_timeout_arg(p, default=3.0, help_text='检测超时秒数')
+    add_json_arg(p)
+    p.set_defaults(func=cmd_status)
+
+    # ping
+    p = subparsers.add_parser('ping', help='Ping 主机可达性检测')
+    p.add_argument('host', help='目标主机名或 IP')
+    p.add_argument('--count', '-c', type=int, default=4, help='探测次数 (默认: 4)')
+    add_timeout_arg(p, default=3.0, help_text='每次探测超时')
+    p.add_argument('--tcp-port', type=int, default=None, help='使用 TCP 端口探测代替 ICMP')
+    add_json_arg(p)
+    p.set_defaults(func=cmd_ping)
+
+    # latency
+    p = subparsers.add_parser('latency', help='TCP 延迟测量')
+    p.add_argument('host', help='目标主机名或 IP')
+    p.add_argument('--port', '-p', type=int, default=80, help='目标端口 (默认: 80)')
+    p.add_argument('--count', '-c', type=int, default=5, help='测量次数 (默认: 5)')
+    add_timeout_arg(p, default=3.0, help_text='每次测量超时')
+    add_json_arg(p)
+    p.set_defaults(func=cmd_latency)
+
+    # speed
+    p = subparsers.add_parser('speed', help='带宽测速')
+    p.add_argument('--host', '-H', default='8.8.8.8', help='测速目标 (默认: 8.8.8.8)')
+    p.add_argument('--port', '-p', type=int, default=53, help='目标端口 (默认: 53)')
+    p.add_argument('--duration', '-d', type=float, default=3.0, help='测试持续时间秒 (默认: 3)')
+    p.add_argument('--chunk-size', type=int, default=8192, help='每块数据大小 (默认: 8192)')
+    add_timeout_arg(p, default=5.0, help_text='连接超时')
+    add_json_arg(p)
+    p.set_defaults(func=cmd_speed)
+
+    # monitor
+    p = subparsers.add_parser('monitor', help='持续网络状态监控')
+    p.add_argument('--interval', '-i', type=float, default=5.0, help='检测间隔秒数 (默认: 5)')
+    p.add_argument('--max-count', '-n', type=int, default=0, help='最大检测次数 (0=持续)')
+    add_timeout_arg(p, default=3.0, help_text='每次检测超时')
+    add_json_arg(p)
+    p.set_defaults(func=cmd_monitor)
 
     return parser
 

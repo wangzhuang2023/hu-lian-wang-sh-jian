@@ -1682,3 +1682,337 @@ class NetworkCore:
                     headers[key.strip()] = value.strip()
 
         return headers
+
+    # ======================== 网络状态检测 ========================
+
+    @staticmethod
+    def ping_host(
+        host: str,
+        count: int = 4,
+        timeout: float = 3.0,
+        tcp_port: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Ping 检测主机可达性。Windows 使用系统 ping，或使用 TCP 端口探测。
+
+        参数:
+            host: 目标主机
+            count: 探测次数
+            timeout: 每次探测超时
+            tcp_port: 如果指定，使用 TCP 连接代替 ICMP ping
+
+        返回:
+            {'host': str, 'method': 'icmp'|'tcp', 'sent': int, 'received': int,
+             'loss_pct': float, 'times_ms': [float], 'min_ms': float,
+             'avg_ms': float, 'max_ms': float, 'stddev_ms': float}
+        """
+        if tcp_port:
+            # TCP ping 模式
+            times_ms: List[float] = []
+            received = 0
+            for i in range(count):
+                try:
+                    t_start = time.time()
+                    addrinfo = socket.getaddrinfo(host, tcp_port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+                    sock = socket.socket(addrinfo[0][0], addrinfo[0][1], addrinfo[0][2])
+                    sock.settimeout(timeout)
+                    sock.connect(addrinfo[0][4])
+                    elapsed = (time.time() - t_start) * 1000
+                    times_ms.append(elapsed)
+                    sock.close()
+                    received += 1
+                except Exception:
+                    times_ms.append(-1.0)  # 超时标记
+            method = "tcp"
+        else:
+            # 系统 ICMP ping
+            import subprocess
+            param = '-n' if os.name == 'nt' else '-c'
+            timeout_param = '-w' if os.name == 'nt' else '-W'
+            timeout_val = str(int(timeout * 1000)) if os.name == 'nt' else str(int(timeout))
+            try:
+                cmd = ['ping', param, str(count), timeout_param, timeout_val, host]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout * count + 5)
+                output = result.stdout
+            except subprocess.TimeoutExpired:
+                output = ""
+            except FileNotFoundError:
+                # 回退到 TCP ping (端口 80)
+                return NetworkCore.ping_host(host, count, timeout, tcp_port=80)
+
+            times_ms = _parse_ping_output(output, host)
+            received = sum(1 for t in times_ms if t >= 0)
+            method = "icmp"
+
+        avg_ms = sum(t for t in times_ms if t >= 0) / max(received, 1)
+        min_ms = min((t for t in times_ms if t >= 0), default=0)
+        max_ms = max((t for t in times_ms if t >= 0), default=0)
+
+        # 标准差
+        valid = [t for t in times_ms if t >= 0]
+        if len(valid) > 1:
+            mean = sum(valid) / len(valid)
+            stddev = (sum((t - mean) ** 2 for t in valid) / len(valid)) ** 0.5
+        else:
+            stddev = 0.0
+
+        return {
+            'host': host,
+            'method': method,
+            'sent': count,
+            'received': received,
+            'loss_pct': round((count - received) / count * 100, 1) if count > 0 else 0,
+            'times_ms': times_ms,
+            'min_ms': round(min_ms, 2),
+            'avg_ms': round(avg_ms, 2),
+            'max_ms': round(max_ms, 2),
+            'stddev_ms': round(stddev, 2),
+        }
+
+    @staticmethod
+    def check_connectivity(
+        test_targets: Optional[List[Tuple[str, int]]] = None,
+        timeout: float = 3.0,
+    ) -> Dict[str, Any]:
+        """
+        检测网络连通性：尝试连接多个知名服务。
+
+        参数:
+            test_targets: [(host, port), ...] 测试目标列表
+            timeout: 每目标超时
+
+        返回:
+            {'online': bool, 'results': {target: {'reachable': bool, 'latency_ms': float}}, ...}
+        """
+        if test_targets is None:
+            test_targets = [
+                ("8.8.8.8", 53),       # Google DNS
+                ("1.1.1.1", 53),       # Cloudflare DNS
+                ("223.5.5.5", 53),     # Ali DNS
+            ]
+
+        results = {}
+        reachable_count = 0
+        for host, port in test_targets:
+            key = f"{host}:{port}"
+            try:
+                t_start = time.time()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                sock.connect((host, port))
+                latency = (time.time() - t_start) * 1000
+                sock.close()
+                results[key] = {'reachable': True, 'latency_ms': round(latency, 2)}
+                reachable_count += 1
+            except Exception:
+                results[key] = {'reachable': False, 'latency_ms': -1}
+
+        return {
+            'online': reachable_count > 0,
+            'reachable_count': reachable_count,
+            'total': len(test_targets),
+            'results': results,
+        }
+
+    @staticmethod
+    def measure_latency(
+        host: str,
+        port: int = 80,
+        count: int = 5,
+        timeout: float = 3.0,
+    ) -> Dict[str, Any]:
+        """
+        测量 TCP 连接延迟。
+
+        参数:
+            host: 目标主机
+            port: 目标端口
+            count: 测量次数
+            timeout: 每次超时
+
+        返回:
+            {'host': str, 'port': int, 'count': int, 'times_ms': [float],
+             'min_ms': float, 'avg_ms': float, 'max_ms': float, 'stddev_ms': float}
+        """
+        times_ms: List[float] = []
+        for _ in range(count):
+            try:
+                t_start = time.time()
+                addrinfo = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+                sock = socket.socket(addrinfo[0][0], addrinfo[0][1], addrinfo[0][2])
+                sock.settimeout(timeout)
+                sock.connect(addrinfo[0][4])
+                elapsed = (time.time() - t_start) * 1000
+                times_ms.append(elapsed)
+                sock.close()
+            except Exception:
+                times_ms.append(-1.0)
+
+        valid = [t for t in times_ms if t >= 0]
+        if not valid:
+            return {
+                'host': host, 'port': port, 'count': count,
+                'times_ms': times_ms,
+                'min_ms': 0, 'avg_ms': 0, 'max_ms': 0, 'stddev_ms': 0,
+            }
+
+        avg = sum(valid) / len(valid)
+        stddev = (sum((t - avg) ** 2 for t in valid) / len(valid)) ** 0.5 if len(valid) > 1 else 0
+
+        return {
+            'host': host,
+            'port': port,
+            'count': count,
+            'times_ms': times_ms,
+            'min_ms': round(min(valid), 2),
+            'avg_ms': round(avg, 2),
+            'max_ms': round(max(valid), 2),
+            'stddev_ms': round(stddev, 2),
+        }
+
+    @staticmethod
+    def measure_bandwidth(
+        host: str = "8.8.8.8",
+        port: int = 53,
+        duration: float = 3.0,
+        chunk_size: int = 8192,
+        timeout: float = 5.0,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        测量上行带宽：持续发送数据并统计吞吐量。
+
+        参数:
+            host: 目标主机
+            port: 目标端口
+            duration: 测试持续时间（秒）
+            chunk_size: 每块数据大小
+            timeout: 连接超时
+            progress_cb: 进度回调 progress_cb(bytes_sent, elapsed_seconds)
+
+        返回:
+            {'bytes_sent': int, 'duration': float, 'throughput_mbps': float,
+             'throughput_mbps_peak': float}
+        """
+        addrinfo = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        sock = None
+        for family, stype, proto, canonname, sockaddr in addrinfo:
+            try:
+                sock = socket.socket(family, stype, proto)
+                sock.settimeout(timeout)
+                sock.connect(sockaddr)
+                break
+            except OSError:
+                if sock:
+                    sock.close()
+                    sock = None
+                continue
+
+        if sock is None:
+            raise ConnectionError(f"带宽测试: 无法连接到 {host}:{port}")
+
+        data = b'\x00' * chunk_size
+        total_sent = 0
+        start_time = time.time()
+        peak_mbps = 0.0
+        last_check = start_time
+        last_bytes = 0
+
+        try:
+            sock.settimeout(1.0)
+            while time.time() - start_time < duration:
+                try:
+                    sock.sendall(data)
+                    total_sent += chunk_size
+                except (socket.timeout, OSError):
+                    break
+
+                now = time.time()
+                if progress_cb:
+                    progress_cb(total_sent, int(now - start_time))
+
+                # 每秒更新峰值
+                if now - last_check >= 1.0:
+                    interval_bytes = total_sent - last_bytes
+                    interval_mbps = (interval_bytes * 8 / (now - last_check) / 1_000_000)
+                    if interval_mbps > peak_mbps:
+                        peak_mbps = interval_mbps
+                    last_check = now
+                    last_bytes = total_sent
+        finally:
+            sock.close()
+
+        elapsed = time.time() - start_time
+        throughput = (total_sent * 8 / elapsed / 1_000_000) if elapsed > 0 else 0
+        if peak_mbps == 0:
+            peak_mbps = throughput
+
+        return {
+            'bytes_sent': total_sent,
+            'duration': round(elapsed, 2),
+            'throughput_mbps': round(throughput, 2),
+            'throughput_mbps_peak': round(peak_mbps, 2),
+        }
+
+    @staticmethod
+    def get_network_status(
+        connectivity_targets: Optional[List[Tuple[str, int]]] = None,
+        latency_targets: Optional[List[Tuple[str, int]]] = None,
+        timeout: float = 3.0,
+    ) -> Dict[str, Any]:
+        """
+        获取综合网络状态快照：接口、连通性、延迟。
+
+        返回:
+            {'timestamp': str, 'local_ip': str, 'interfaces': [...],
+             'connectivity': {...}, 'latency': {...}}
+        """
+        status: Dict[str, Any] = {
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'local_ip': get_local_ip(),
+            'interfaces': get_all_local_ips(),
+        }
+
+        # 连通性
+        status['connectivity'] = NetworkCore.check_connectivity(
+            test_targets=connectivity_targets, timeout=timeout,
+        )
+
+        # 延迟（到常用服务）
+        if latency_targets is None:
+            latency_targets = [("8.8.8.8", 53), ("1.1.1.1", 53), ("baidu.com", 80)]
+        latency_results = {}
+        for host, port in latency_targets:
+            result = NetworkCore.measure_latency(host, port, count=3, timeout=timeout)
+            latency_results[f"{host}:{port}"] = result['avg_ms']
+        status['latency'] = latency_results
+
+        return status
+
+
+# ========================================================================
+# Ping 输出解析辅助函数
+# ========================================================================
+
+def _parse_ping_output(output: str, host: str) -> List[float]:
+    """解析系统 ping 命令输出，返回延迟列表（毫秒）"""
+    import re
+    times: List[float] = []
+
+    # Windows: "时间=XXms" 或 "time=XXms"
+    # Linux: "time=XX.X ms"
+    patterns = [
+        r'时间[=<]\s*(\d+\.?\d*)\s*ms',
+        r'time[=<]\s*(\d+\.?\d*)\s*ms',
+        r'时间[=<](\d+)ms',
+        r'time[=<](\d+\.?\d*)',
+    ]
+
+    for line in output.split('\n'):
+        for pat in patterns:
+            m = re.search(pat, line, re.IGNORECASE)
+            if m:
+                times.append(float(m.group(1)))
+                break
+
+    return times
